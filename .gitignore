@@ -1,0 +1,9 @@
+*.pdf
+*_data/
+*.html
+.DS_Store
+.RData
+.Rhistory
+.ipynb*
+*.csv
+*.RDATA

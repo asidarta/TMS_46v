@@ -1,0 +1,562 @@
+---
+title: "TMS_46v"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+The task involves two separate sessions: motor learning and working memory, counterbalanced.
+
+(1) In the motor learning task, subjects randomly explored the space along an invisible arc in the left workspace. On the 16th trial, unbeknownst to them, we set the target by providing a boom. Subsequently, they have to keep repeating the movements to obtain more booms.
+
+(2) In the working memory task, subjects arm were displaced in 3 different directions. They had to guess whether the test direction, following it, was one of the previously given directions. Only 2 lags were tested. WM score was computed as Hit - FA. There were 3 blocks during PRE and POST tms respectively.
+
+```{r include=FALSE, cache=FALSE}
+
+######### This file directly reads textfile from the experiment ############
+rm(list = ls())
+options(width=200)
+
+require('ggplot2')
+require('plyr')
+require('Rmisc')
+require('R.matlab')
+require("reshape")
+
+getwd()
+dirpath <- "/Users/ae2012/Documents/R/TMS_data/"   # home directory in linux is shown as ~
+setwd(dirpath)
+
+## Easier to select which test version to use. This also determines filename to save.
+myTest_version_string = "tms_param"   
+#source("test_param.R")
+source(paste(myTest_version_string,".R",sep=""))
+
+
+allsubjects <- NULL
+anchors <- 1: nANCHOR
+
+##############################
+
+for (i in 1 : nsubj ) {
+
+  subjtab <- NULL
+  
+  for (mytask in tasks) {
+  #print(mytask)
+  
+     for (block.num in 1 : nBLOCK.WM) {
+       
+         subjname <- s.names[i]
+         my.file <- paste(substr(mytask,0,3), "_", subjname, block.num,".txt", sep="")
+         my.file <- paste(dirpath,subjname,"_data/",my.file, sep="")
+
+         # [Updated Feb 2018] I add error handler if Visual condition files aren't found.
+         if (file.exists(my.file)) {
+            tab <- read.table(file=my.file, sep=" ")
+            # Remove NA columns; leaving only 8 usable columns!
+            tab <- tab[,colSums(is.na(tab))==0]
+            # Remove DELAY column, I don't need that!
+            if (ncol(tab) > 7) { tab <- tab[,1:7] }
+            # Then, give column names
+            names(tab) <- c('trial',c(sprintf("anchor%i",anchors)),'probe','answer','RT') 
+            ## Remove "ANSWER:" and get the Yes/No response...
+            tab$answer <- sapply(tab[, nANCHOR + 3],
+                                 function(x) {
+                                   as.numeric(strsplit(as.character(x),":")[[1]][2])   # This is a list operation
+                                 })
+         }
+         
+         else {
+            print(paste(subjname,"- File doesn't exist! NA will be used."))
+            tab <- tab[FALSE,]  # Well this won't work if no prior tab df exists!
+            tab[1,] <- c(rep(NA,11))
+            tab$answer <- NA
+         }
+         tab$block   <- block.num
+         tab$subj.id <- subjname
+         tab$group   <- s.group[i]   # Control versus Treatment???
+         subjtab <- rbind(subjtab, tab);   # Nice function to append data frame
+     }
+    
+  }
+  # Without doing this, function in ddply cannot distinguish the same trial number but of multiple blocks. 
+  #subjtab$trial <- subjtab$block*24 + subjtab$trial.in.block
+  subjtab$trial = 1: length(subjtab$subj.id==subjname)
+  allsubjects <- rbind(allsubjects, subjtab)
+  
+}
+
+
+
+## Make a column that represents for a given trial, whether the probe was one of the anchors or not
+get.lag <- function(row) {
+  ## Takes as input a row, and outputs a number that tells us which anchor was equal to the probe,
+  ## or, if the probe was not among the anchors, then it returns NA.
+  #index <- which(row$probe == row[,c('anchor1','anchor2','anchor3','anchor4','anchor5','anchor6')])
+  index <- which(row$probe == row[,c(sprintf("anchor%i",anchors))])
+  if (length(index)==0) { return (NA) } else { return (index-nANCHOR-1) }
+  ## Ananda update: chronological order uses negative value, lag -6 means 6 directions ago from probe.
+}
+
+
+
+allsubjects$lag <- NA
+## Go and check each row of our allsubjects data.
+for (i in 1:nrow(allsubjects)) {
+  allsubjects[i,]$lag <- get.lag(allsubjects[i,]);   ## Call the 'get.lag' function
+}
+
+
+
+# Creating 2 additional columns for correct answer and subject score!
+allsubjects$lag <- as.factor(allsubjects$lag)
+allsubjects$correct.answer <- ifelse( is.na(allsubjects$lag), 0, 1)
+allsubjects$score <- ifelse( allsubjects$answer==allsubjects$correct.answer, 1, 0)
+
+
+## For each of the anchors, compute the distance to the probe.
+## NOTE: we invert the order of the anchors here. So dist1 refers to the distance
+## to the probe of the *most recent* anchor (i.e. anchor 6), not the first anchor.
+for (i in 1:nANCHOR) {
+  allsubjects[,sprintf("dist%i",i)] <- abs(allsubjects$probe - allsubjects[,sprintf("anchor%i",nANCHOR+1-i)])
+}
+
+#str(allsubjects)
+
+
+
+# TODO Ananda exercise: decide for each trial whether it is probe.outside or probe.inside,
+# and then check whether proportion yes is different.
+get.outside <- function(row) {
+   ## Takes as input a row, and outputs a number that tells us when probe larger than maximum/minimum anchor
+   #index <- which(row$probe > row[,c('anchor1','anchor2','anchor3','anchor4')])
+   indexmax <- which(row$probe > max(row[,c(sprintf("anchor%i",anchors))]))
+   indexmin <- which(row$probe < min(row[,c(sprintf("anchor%i",anchors))]))
+   if (length(indexmax)>0 | (length(indexmin)>0)) { return (1) } else { return (NA) }
+}
+
+allsubjects$outside <- NA
+
+for (i in 1:nrow(allsubjects)) {
+   allsubjects[i,]$outside <- get.outside(allsubjects[i,])
+}
+
+
+###################
+
+prop.yes <- ddply ( allsubjects, 
+                    c("subj.id", "block", "lag", "group"),  # Note the grouping variables
+                    function(xx) {
+                        if (length(xx$answer)>1 && !is.na(xx$answer)) {
+                           prop = sum(xx$answer)/length(xx$answer)
+                           n = nrow(xx)
+                           if ((sum(xx$answer) == length(xx$answer)) | (sum(xx$answer) == 0)) {
+                              corrected = (sum(xx$answer) + 0.5)/(length(xx$answer)+1)
+                           } 
+                           else { corrected = prop }
+                        }
+                        else { 
+                           prop = NA;  corrected = NA; n = 1 } # revised Feb 2018, for visual task with NA
+                        return (c("uncorr" = prop,
+                                  "prop.yes"= corrected,    ##### Corrected or uncorrected ??????
+                                  "n" = n))
+                    })
+
+
+# NOTE: prop.yes contains both proportion of YES responses in trials when probe = anchor and probe = lures.
+# We only want the Hit rate, that is, when probe = anchor. Next, we have to select just the lure trials 
+# which we need to extract false alarm to compute hit minus false alarm.
+#
+no.lag <- subset(prop.yes, is.na(lag))
+
+false.alarms <- data.frame(subj.id     = no.lag$subj.id,
+                           block       = no.lag$block,
+                           false.alarm = no.lag$prop.yes,    # Here, FA is based on corrected values
+                           true.neg    = 1-no.lag$prop.yes)  # Specificity, true negative rate
+
+# Merge two data frames!
+#hit.fa <- merge(subset(prop.yes,!is.na(lag)), false.alarms)
+hit.fa <- merge(subset(prop.yes,n!=12), false.alarms)
+
+
+## Now compute WM performance;  (Revised Feb 2018 for visual WM with no data, NA).
+## Which one is the best performance measure for WM?
+hit.fa$hit.min.fa <- hit.fa$prop.yes- hit.fa$false.alarm                   # (1) Hit-FA rate, corrected
+hit.fa$dprime <- qnorm(hit.fa$prop.yes) - qnorm(hit.fa$false.alarm)        # (2) dprime, corrected
+hit.fa$beta <- exp(-qnorm(hit.fa$prop.yes)*qnorm(hit.fa$prop.yes)/2 +      # (3) beta, corrected
+                    qnorm(hit.fa$false.alarm)*qnorm(hit.fa$false.alarm)/2)
+
+
+```
+
+#### Analyses on WM Scores Per Lag
+```{r echo=FALSE, cache=FALSE}
+pre.post <- ddply(hit.fa, c("subj.id","lag","group"), function(xx){
+                  pre  <- subset(xx, block <=3 )
+                  post <- subset(xx, block > 3 )
+                  return(data.frame( "pre.wm"  = mean(pre$hit.min.fa, na.rm=TRUE),
+                                     "post.wm" = mean(post$hit.min.fa, na.rm=TRUE),
+                                     "pre.hit" = mean(pre$prop.yes, na.rm=TRUE),
+                                     "post.hit"= mean(post$prop.yes, na.rm=TRUE),
+                                     "pre.fa"  = mean(pre$false.alarm, na.rm=TRUE),
+                                     "post.fa" = mean(post$false.alarm, na.rm=TRUE) ))
+} )
+
+
+##### Let's melt the data frame
+pre.post.melt <- melt(pre.post, id.vars = c("subj.id","lag","group"), 
+                      measure.vars = c("pre.wm", "post.wm","pre.hit", 
+                                       "post.hit","pre.fa", "post.fa"))
+colnames(pre.post.melt)[4] = "time"
+colnames(pre.post.melt)[5] = "score"
+
+# (1) Compute hit minus false alarm of GROUP DATA!
+grp.lag.hit.fa <- ddply(pre.post.melt, c("lag","group","time"), 
+                function(xx){
+                     mean = mean(xx$score)
+                     stde = sd(xx$score)/sqrt(length(xx$score))
+                     new.var = as.character(xx$time)
+                     time = unlist(strsplit(new.var, split="\\."))[1]
+                     var  = unlist(strsplit(new.var, split="\\."))[2]
+                     return(data.frame("time"=time,"n"=nrow(xx),
+                                       "param"=var,"mean"=mean,"se"=stde))
+})
+
+# Plot the graph for each score......
+ggplot( grp.lag.hit.fa, aes(x=time, y=mean,
+                        ymax=mean+se, 
+                        ymin=mean-se,
+                        group=lag,
+                        col=lag) ) + 
+  geom_point() + geom_line() +
+  geom_errorbar(width=0) +
+  facet_grid(param~group,scales="free_y") +
+  theme_bw()
+print("Working memory score is denoted as wm = hit - fa")
+
+```
+
+#### What if I collapse the lags by taking the average between the two lags?!
+
+```{r echo=FALSE, cache=FALSE}
+
+# (2) What if we disregard the lags!?
+grp.hit.fa <- ddply(pre.post.melt, c("group","time"), 
+                    function(xx){
+                      mean = mean(xx$score)
+                      stde = sd(xx$score)/sqrt(length(xx$score))
+                      new.var = as.character(xx$time)
+                      time = unlist(strsplit(new.var, split="\\."))[1]
+                      var  = unlist(strsplit(new.var, split="\\."))[2]
+                      return(data.frame("time"=time,"n"=nrow(xx),
+                                        "param"=var,"mean"=mean,"se"=stde))
+                    })
+
+ggplot( grp.hit.fa, aes(x=time, y=mean,
+                        ymax=mean+se, 
+                        ymin=mean-se, group = group) ) + 
+  geom_point() + geom_line() +
+  geom_errorbar(width=0) +
+  facet_grid(param~group,scales="free_y") +
+  theme_bw()
+```
+
+
+```{r echo=FALSE, warning=FALSE, cache=FALSE}
+# (3) Perform ANOVA......
+require("ez")
+
+ezANOVA( data=subset(pre.post.melt, pre.post.melt$time %in% c("pre.wm","post.wm")),
+         dv=score,
+         wid=subj.id,
+         within=time,
+         between=group )
+         
+```
+
+#### What if instead of doing ANOVA I do one-tailed t-test?
+For each subject, I computed the difference between POST minus PRE in both groups. Then, the mean of this difference will be compared, between the treatment and sham groups.
+
+```{r echo=FALSE, cache=FALSE}
+
+#(5) What about finding the difference?
+pre.post$wm <- pre.post$post.wm-pre.post$pre.wm
+pre.post$wm.norm <- pre.post$wm/pre.post$pre.wm
+
+pre.post$hit <- pre.post$post.hit-pre.post$pre.hit
+pre.post$hit.norm <- pre.post$hit/pre.post$pre.hit
+
+pre.post$fa <- pre.post$post.fa-pre.post$pre.fa
+pre.post$fa.norm <- pre.post$fa/pre.post$pre.fa
+
+pre.post.diff <- pre.post[,-which(names(pre.post) %in% c( "pre.wm","post.wm",
+                                                          "pre.hit","post.hit",
+                                                          "pre.fa","post.fa"))]
+
+diff.score <- melt(pre.post.diff, id.vars = c("subj.id","lag","group"),
+                   measure.vars = c("wm.norm","wm",
+                                    "hit.norm","hit",
+                                    "fa.norm","fa"))
+colnames(diff.score)[4] = "time"
+colnames(diff.score)[5] = "score"
+
+
+grp.diff <- ddply(diff.score, c("group","time"), 
+                        function(xx){
+                          mean = mean(xx$score)
+                          stde = sd(xx$score)/sqrt(length(xx$score))
+                          return(data.frame("n"=nrow(xx),"mean"=mean,"se"=stde))
+                        })
+
+# Plot the graph for each score. Position dodge is to make the bars side-by-side.
+# Note: What is width argument in position_dodge()?
+ggplot(  subset(grp.diff, grp.diff$time %in% c( "wm","hit","fa")), 
+        aes(x=group,y=mean,ymax=mean+se,ymin=mean-se,fill=group )) + 
+  geom_bar(stat="identity", position=position_dodge(width=0.9))  +
+  geom_point(aes(y=mean), position=position_dodge(width=0.9)) +
+  geom_errorbar(stat="identity", width=0,position=position_dodge(width=0.9)) +
+  facet_grid(.~time,scales="free_y") +
+  #ylim(-0.1,0.05)+
+  theme_bw()
+
+diff.score.avg <- ddply(diff.score, c("subj.id","group","time"), 
+                                 function(xx){
+                                   mean = mean(xx$score)
+                                   stde = sd(xx$score)/sqrt(length(xx$score))
+                                   return(data.frame("n"=nrow(xx),"mean"=mean,"se"=stde))
+                                 }) 
+diff.score.avg <- subset(diff.score.avg, diff.score.avg$time=="wm")
+
+t <- t.test(subset(diff.score.avg, diff.score.avg$group=="tms")$mean, 
+       subset(diff.score.avg, diff.score.avg$group=="sham")$mean,
+       alternative = c("less"))
+sprintf("Difference in WM scores, Sham vs TMS group, p = %f",t$p.value)
+
+```
+
+### Kinematics Analyses of Motor Learning
+
+```{r echo=FALSE, cache=FALSE, fig.width=6, fig.height=6}
+##############################################
+############### MOTOR LEARNING ###############
+##############################################
+getwd()
+options(width=200)
+library(corrplot)
+
+dirpath <- "~/Documents/R/TMS_data/"   # home directory in linux is shown as ~
+setwd(dirpath)
+
+## Easier to select which test version to use. This also determines filename to save.
+myTest_version_string = "tms_param"   
+source(paste(myTest_version_string,".R",sep=""))
+
+allsubjects <- NULL
+
+for ( i in 1 : nsubj ) {
+  subjtab <- NULL
+  for ( block.num in 1 : nBLOCK.MOTOR ) {
+     subjname <- s.names[i]
+     group <- s.group[i]
+     my.file <- paste("motorLog_", subjname, '_', block.num,".txt", sep="")
+     my.file <- paste(dirpath,subjname,"_data/",my.file, sep="")
+     # Load textfile as table, very easy in R. Note the column separator!
+     tab <- read.table(file=my.file, sep=",", header=TRUE)
+     tab$subj.id <- subjname
+     tab$group   <- group
+     tab$block   <- block.num
+     tab$abs.angle <- abs(tab$angle_maxv_shift)
+     tab$success <- ifelse(tab$boom,"success","failure")
+     nrow(tab)
+     # Nice function to append (COMBINE) several data frames together.
+     subjtab <- rbind(subjtab, tab)
+  }
+  subjtab$newTrial = 1:nrow(subjtab)
+  allsubjects <- rbind(allsubjects, subjtab)
+}
+
+
+# (1) Group average for the individual trial....
+# Exclude the pre-train block...
+my.df <- ddply( subset(allsubjects, task!="pre_train"), "subj.id", function(xx){
+                      xx$newTrial = 1:nrow(xx)
+                      xx$angle_maxv_shift = abs(xx$angle_maxv_shift)
+                      return(xx) }
+)
+
+error.grp <- summarySE( my.df, "abs.angle", c("newTrial","task","group"), na.rm = TRUE)
+error.grp <- subset(error.grp, error.grp$newTrial > 1)
+
+g<-ggplot(error.grp, aes( x=newTrial,y=abs.angle,
+                       ymin=abs.angle-se,
+                       ymax=abs.angle+se,
+                       color=task) ) +
+  scale_color_manual(values=c("training"="blue","motor_post"="red")) +
+  scale_fill_manual (values=c("training"="blue","motor_post"="red")) +
+  geom_point() + geom_errorbar(width=0) +
+  geom_smooth(method="lm") +
+  #geom_ribbon( aes(fill=task), alpha=0.4 ) +
+  ylim(0,20) + 
+  ggtitle("Accuracy performance across all subjects") +
+  xlab("Trial number") + ylab("Mean Absolute Deviation (degree)") +
+  facet_grid(group~.) +
+  theme_bw() + theme( 
+    panel.background = element_rect(fill = "transparent") # bg of the panel
+    , plot.background = element_rect(fill = "transparent") # bg of the plot
+    , panel.grid.major = element_blank() # get rid of major grid
+    , panel.grid.minor = element_blank() # get rid of minor grid
+  )
+
+ggsave( sprintf('David-grant.pdf'),g)
+
+
+### Get learning slope? Using ddply with a predefined function.
+get.learn.slope <- function(xx) {
+  train.blocks <- subset(xx, task=="training")
+  tot_trial    <- seq(1, length(train.blocks$angle_maxv_shift))
+  yy <- lm(abs(train.blocks$angle_maxv_shift) ~ tot_trial)
+  yy <- yy$coefficients[2]
+  return (yy)
+}
+
+lin.slope <- ddply(allsubjects, c("subj.id","group"), get.learn.slope)
+
+t <- t.test(subset(lin.slope,group=="sham" )$tot_trial,
+       subset(lin.slope,group=="tms")$tot_trial,
+       alternative = c("less"))
+
+sprintf("Slope Difference of Linear Fit, Sham vs TMS group, p = %f",t$p.value)
+
+
+
+
+
+# (2) Average accuracy motor post
+post.grp <- subset(allsubjects, task=="motor_post")
+#post.grp <- summarySE( post.grp, "abs.angle", c("task","group"), na.rm = TRUE)
+t <- t.test(subset(post.grp,group=="tms" )$abs.angle,
+       subset(post.grp,group=="sham")$abs.angle)
+
+sprintf("Accuracy difference during Motor Post, Sham vs TMS group, p = %f",t$p.value)
+
+```
+
+The stats follow. The first part is the t-test comparing total reinforcement. The second part is comparing average absolute deviation during POST.
+
+```{r echo=FALSE, cache=FALSE, fig.width=8, fig.height=4}
+# (3) Total reinforcement.....
+reward <- summarySE(my.df, "boom", c("subj.id","group"))
+#reward <- summarySE(reward, "boom", c("group"))
+t <- t.test(subset(reward,group=="tms" )$boom,
+       subset(reward,group=="sham")$boom)
+
+sprintf("Difference in total boom, Sham vs TMS group, p = %f",t$p.value)
+
+
+# (4) Total reinforcement for different blocks.....
+reward.blk <- summarySE(my.df, "boom", c("subj.id","group","block"))
+reward.blk.avg <- summarySE(reward.blk, "boom", c("group","block"))
+reward.blk.avg <- subset(reward.blk.avg, reward.blk.avg$block<5)
+
+# Then draw the plot to compare two groups...
+ggplot(subset(reward.blk.avg, block%in%c(1,4)),
+       aes(x=block,y=boom,ymin=boom-se,ymax=boom+se,fill=group) ) +
+  geom_bar(stat="identity", position=position_dodge())  +
+  geom_point(aes(y=boom), position=position_dodge(width=2.9)) +
+  geom_errorbar(stat="identity",width=0,position=position_dodge(width=2.9)) +
+  xlab("Block") + ylab("Reward") +
+  theme_bw()
+#ggsave("plot.pdf",g)
+```
+What if you compute the difference in reward obtained between block 1 and 4. 
+TMS group versus Sham group in terms of reward increment
+
+```{r echo=FALSE, cache=FALSE, fig.width=8, fig.height=4}
+### What if we compute the difference between block 1 and block 4.
+reward.diff <- ddply(reward.blk, c("subj.id","group"), function(xx){
+                  early = subset(xx, block==1)
+                  late  = subset(xx, block==4)
+                  c("diff"=late$boom - early$boom) }
+                  )
+
+t <- t.test(subset(reward.diff,group=="tms" )$diff,
+       subset(reward.diff,group=="sham")$diff,
+       alternative = c("less"))
+
+sprintf("Reward increment between Sham vs TMS group, p = %f",t$p.value)
+
+
+```
+
+#### Change in movement direction contingent upon current trial outcome.....
+Trial-to-trial change in movement direction was also compared between the TMS and sham group. The plot below includes 4 training blocks and motor post without reinforcement (so it is shown as "failure").
+
+```{r echo=FALSE, cache=FALSE, fig.width=8, fig.height=4}
+# (5) Average delta.m
+d.m <- ddply( allsubjects,  c('subj.id','task',"group"),
+              function(xx) {
+                xx <- xx[ order(xx$newTrial), ]  # ensuring the order
+                abs.dm<-NULL; delta.m<-NULL; next.boom<-NULL
+                for (i in 1:(nrow(xx)-1)) {
+                  # Accessing each trial; keep adding element to variable "delta.m"
+                  delta.m  <- c(delta.m,    xx[i+1,"angle_maxv_shift"]-xx[i,"angle_maxv_shift"])
+                  abs.dm   <- c(abs.dm, abs(xx[i+1,"angle_maxv_shift"]-xx[i,"angle_maxv_shift"]))
+                  next.boom<- c(next.boom, xx[i+1,"boom"])
+                }
+                delta.m  <- c(delta.m, NA); abs.dm <- c(abs.dm, NA)
+                return(data.frame(trial=xx$newTrial,
+                                  block=xx$block,
+                                  session=unique(xx$session),
+                                  delta.m=delta.m,
+                                  abs.dm = abs.dm,
+                                  next.boom = c(next.boom,0),
+                                  success=xx$success )) 
+              }
+)
+avg.trial.trial <- ddply( d.m, c("task","success","group","block"), 
+                          function(xx){
+                            n.subj = length(unique(d.m$subj.id))
+                            c( avg = mean(xx$abs.dm, na.rm = TRUE),
+                               N  = length(xx$abs.dm),
+                               n.subj  = n.subj,
+                               se = sd(xx$abs.dm, na.rm = TRUE)/sqrt(n.subj)) # Note!
+                          })
+
+# Create clearer naming to indicate reward status for the training phase.
+avg.trial.trial$task.block = ifelse (avg.trial.trial$task=="training",
+                                      sprintf("%s_%s", avg.trial.trial$task, avg.trial.trial$block), 
+                                      as.character(avg.trial.trial$task))
+avg.trial.trial$task.block <- as.factor(avg.trial.trial$task.block)
+
+# Reorder the levels according to the following task phase....
+task = c("pre_train", "training_1","training_2","training_3","training_4","motor_post")
+avg.trial.trial$task.block <- factor(avg.trial.trial$task.block, levels = task)
+
+avg.trial.trial <- subset(avg.trial.trial, avg.trial.trial$task!="pre_train")
+
+ggplot(avg.trial.trial, aes(x=task.block, 
+                            y=avg, 
+                            ymin=avg-se,
+                            ymax=avg+se,
+                            group=success,
+                            color=success)) + 
+  geom_point() + geom_line() +
+  geom_errorbar(width=0) + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Average magnitude of change in movement direction") +
+  ylab("Angle (degree)") + xlab("") +
+  facet_grid(.~group) +
+  theme_bw() + theme( 
+    panel.background = element_rect(fill = "transparent") # bg of the panel
+    , plot.background = element_rect(fill = "transparent") # bg of the plot
+    , panel.grid.major = element_blank() # get rid of major grid
+    , panel.grid.minor = element_blank() # get rid of minor grid
+    
+  )
+```
+
+
+
+
